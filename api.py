@@ -8,6 +8,7 @@ Endpoints:
 
 import json
 import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -16,11 +17,27 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent import ResearchAgent
-
 load_dotenv()
 
-app = FastAPI(title="AI Research Assistant", version="2.0.0")
+# Agent is initialised inside lifespan so routes are ALWAYS registered first
+_agent = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _agent
+    try:
+        from agent import ResearchAgent
+        _agent = ResearchAgent()
+        print("✓ Agent initialised successfully")
+    except Exception as exc:
+        print(f"✗ Agent init failed: {exc}")
+        _agent = None
+    yield
+    # shutdown — nothing to clean up
+
+
+app = FastAPI(title="AI Research Assistant", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,9 +45,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Single shared agent instance (holds ChromaDB connection + Gemini client)
-_agent = ResearchAgent()
 
 
 # ── Models ────────────────────────────────────────────────────────────────
@@ -43,6 +57,8 @@ class ChatRequest(BaseModel):
 
 @app.get("/health")
 async def health():
+    if _agent is None:
+        return {"status": "starting", "model": "gemini-2.5-flash", "kb_chunks": 0}
     return {
         "status": "ok",
         "model": "gemini-2.5-flash",
@@ -54,6 +70,9 @@ async def health():
 async def chat(req: ChatRequest):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    if _agent is None:
+        raise HTTPException(status_code=503, detail="Agent is still starting up — please retry in a few seconds")
 
     async def event_stream():
         try:
@@ -69,7 +88,7 @@ async def chat(req: ChatRequest):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # disables Nginx buffering on Render/Railway
+            "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
     )
@@ -92,5 +111,5 @@ if __name__ == "__main__":
         "api:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", 8000)),
-        reload=True,
+        reload=False,          # lifespan + reload don't mix well
     )
