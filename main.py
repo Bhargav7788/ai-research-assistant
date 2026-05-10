@@ -9,6 +9,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 
+from langsmith import traceable
 from rag import RAGPipeline
 from mcp_tools import MCPToolRegistry
 
@@ -65,6 +66,7 @@ class ResearchAssistant:
     # Agentic query loop: RAG context injection + MCP tool execution
     # ------------------------------------------------------------------
 
+    @traceable(run_type="chain", name="CLI Research Query", tags=["cli"])
     def query(self, user_input: str) -> str:
         rag_chunks = self.rag.search(user_input)
         if rag_chunks:

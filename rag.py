@@ -8,6 +8,7 @@ import chromadb  # vector store only — no embedding hook used
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+from langsmith import traceable
 
 load_dotenv()
 
@@ -27,6 +28,7 @@ class DocumentChunk:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@traceable(run_type="embedding", name="Gemini Embed", tags=["embedding", "gemini"])
 def _embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> List[List[float]]:
     """Embed a list of texts using Gemini. Returns list of float vectors."""
     embeddings = []
@@ -89,6 +91,7 @@ class VectorStore:
             metadata={"hnsw:space": "cosine"},
         )
 
+    @traceable(run_type="tool", name="ChromaDB Ingest", tags=["chromadb", "rag"])
     def add_chunks(self, chunks: List[DocumentChunk]) -> int:
         if not chunks:
             return 0
@@ -108,6 +111,7 @@ class VectorStore:
         )
         return len(new)
 
+    @traceable(run_type="retriever", name="ChromaDB Retrieval", tags=["chromadb", "rag"])
     def search(self, query: str, k: int = TOP_K) -> List[DocumentChunk]:
         if self.count() == 0:
             return []

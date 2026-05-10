@@ -6,6 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 from google.genai import types
+from langsmith import traceable
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,7 @@ _DECLS: List[types.FunctionDeclaration] = [
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+@traceable(run_type="tool", name="DuckDuckGo Search", tags=["web-search"])
 def _ddg_search(query: str, max_results: int) -> List[Dict]:
     """Core DuckDuckGo search — returns list of {title, url, snippet}. Retries on failure."""
     import time
@@ -99,6 +101,7 @@ def web_search(query: str, max_results: int = 5) -> str:
     return text
 
 
+@traceable(run_type="tool", name="Web Search Structured", tags=["web-search"])
 def web_search_structured(query: str, max_results: int = 5) -> Tuple[str, List[Dict]]:
     """
     Returns (formatted_text, results_list) where each result has {title, url, snippet}.
@@ -117,6 +120,7 @@ def web_search_structured(query: str, max_results: int = 5) -> Tuple[str, List[D
     return "\n".join(lines).strip(), results
 
 
+@traceable(run_type="tool", name="Fetch URL", tags=["web-fetch"])
 def fetch_url(url: str) -> str:
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (ResearchBot/1.0)"})
@@ -146,6 +150,7 @@ def read_file(filepath: str) -> str:
         return f"Error reading file: {exc}"
 
 
+@traceable(run_type="tool", name="Calculate", tags=["math"])
 def calculate(expression: str) -> str:
     safe = {k: v for k, v in math.__dict__.items() if not k.startswith("_")}
     safe.update({"abs": abs, "round": round, "min": min, "max": max})

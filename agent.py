@@ -1,21 +1,24 @@
 """
-Streaming Research Agent
-------------------------
-Flow for EVERY query:
-  1. Live web search with the exact user question (always first)
-  2. RAG/ChromaDB checked for additional stored context
-  3. Both combined → Gemini 2.5 Flash streams the answer
-  4. Web sources shown at the bottom of every response
+Streaming Research Agent — with LangSmith tracing
+---------------------------------------------------
+Every step is traced:
+  - Top-level "Research Agent" chain run per query
+  - DuckDuckGo web search (child run)
+  - ChromaDB RAG retrieval (child run)
+  - Gemini 2.5 Flash generation (child LLM run, with token usage + latency)
 """
 
 import asyncio
 import os
 import threading
-from typing import AsyncGenerator, Dict, List
+import time
+from typing import AsyncGenerator, Dict, List, Optional
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from langsmith import traceable
+from langsmith.run_trees import RunTree
 
 from mcp_tools import web_search_structured
 from rag import RAGPipeline
@@ -25,6 +28,8 @@ load_dotenv()
 MODEL = "gemini-2.5-flash"
 MAX_RAG_CHUNKS = 3
 MAX_WEB_RESULTS = 6
+_TRACING = os.getenv("LANGCHAIN_TRACING_V2", "").lower() == "true"
+_LS_PROJECT = os.getenv("LANGCHAIN_PROJECT", "ai-research-assistant")
 
 SYSTEM_PROMPT = """\
 You are an expert AI Research Assistant with access to live web search results.
@@ -42,95 +47,174 @@ Rules:
 """
 
 
+# ── LangSmith RunTree helpers ────────────────────────────────────────────────
+
+def _start_run(name: str, run_type: str, inputs: dict,
+               parent: Optional[RunTree] = None) -> Optional[RunTree]:
+    if not _TRACING:
+        return None
+    try:
+        kwargs = dict(name=name, run_type=run_type, inputs=inputs,
+                      project_name=_LS_PROJECT)
+        run = parent.create_child(**kwargs) if parent else RunTree(**kwargs)
+        run.post()
+        return run
+    except Exception:
+        return None
+
+
+def _end_run(run: Optional[RunTree], outputs: dict, error: str = None) -> None:
+    if run is None:
+        return
+    try:
+        if error:
+            run.end(error=error)
+        else:
+            run.end(outputs=outputs)
+        run.patch()
+    except Exception:
+        pass
+
+
+# ── Agent ────────────────────────────────────────────────────────────────────
+
 class ResearchAgent:
     def __init__(self):
         self.rag = RAGPipeline()
         self._client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
+    # ── Traced sub-operations (children of the root run) ─────────────────
+
+    @traceable(run_type="tool", name="Web Search", tags=["web-search"])
+    async def _search_web(self, query: str) -> tuple:
+        """Traced async wrapper — LangSmith records latency + outputs."""
+        return await asyncio.to_thread(web_search_structured, query, MAX_WEB_RESULTS)
+
+    @traceable(run_type="retriever", name="RAG Retrieval", tags=["chromadb", "rag"])
+    async def _search_rag(self, query: str) -> list:
+        """Traced async wrapper — LangSmith records score + chunks returned."""
+        return await asyncio.to_thread(self.rag.search, query, MAX_RAG_CHUNKS)
+
+    # ── Main streaming loop ───────────────────────────────────────────────
+
     async def stream(self, message: str) -> AsyncGenerator[Dict, None]:
         sources: List[Dict] = []
         context_parts: List[str] = []
 
-        # ── Step 1: Live web search — ALWAYS, with the exact question ──
-        yield {"type": "tool_call", "tool": "web_search", "query": message}
-        await asyncio.sleep(0)
+        # Top-level trace for the entire request
+        root = _start_run(
+            name="Research Agent",
+            run_type="chain",
+            inputs={"question": message},
+        )
 
-        web_text = ""
         try:
-            search_text, results = await asyncio.to_thread(
-                web_search_structured, message, MAX_WEB_RESULTS
+            # ── Step 1: Live web search ───────────────────────────────────
+            yield {"type": "tool_call", "tool": "web_search", "query": message}
+            await asyncio.sleep(0)
+
+            web_text = ""
+            try:
+                search_text, results = await self._search_web(message)
+
+                if results:
+                    web_text = search_text
+                    context_parts.append(f"=== WEB SEARCH RESULTS ===\n{search_text}")
+                    for r in results:
+                        sources.append({
+                            "type": "web_search", "icon": "🌐",
+                            "label": r["title"] or r["url"],
+                            "detail": r["url"], "url": r["url"],
+                        })
+                    yield {"type": "tool_result",
+                           "content": f"Found {len(results)} results"}
+
+                    asyncio.create_task(
+                        asyncio.to_thread(
+                            self.rag.add_text, search_text, f"web:{message[:80]}"
+                        )
+                    )
+                else:
+                    yield {"type": "status",
+                           "content": "Web search returned no results — using Gemini knowledge"}
+
+            except Exception as exc:
+                yield {"type": "status",
+                       "content": f"Web search error: {exc} — using Gemini knowledge"}
+
+            # ── Step 2: RAG supplementary context ────────────────────────
+            try:
+                rag_chunks = await self._search_rag(message)
+                good = [
+                    c for c in rag_chunks
+                    if c.metadata.get("score", 0) >= 0.6
+                    and not c.metadata.get("source", "").startswith(
+                        f"web:{message[:20]}"
+                    )
+                ]
+                if good:
+                    context_parts.append(
+                        f"=== KNOWLEDGE BASE ===\n{self.rag.build_context(good)}"
+                    )
+                    for chunk in good[:2]:
+                        sources.append({
+                            "type": "knowledge_base", "icon": "📚",
+                            "label": chunk.metadata.get("source", "Knowledge Base"),
+                            "detail": f"relevance: {chunk.metadata.get('score', '')}",
+                        })
+            except Exception:
+                pass
+
+            # ── Step 3: Stream Gemini answer ──────────────────────────────
+            yield {"type": "status", "content": "Generating answer…"}
+            await asyncio.sleep(0)
+
+            full_context = "\n\n".join(context_parts)
+            user_content = (
+                f"Question: {message}\n\n{full_context}"
+                if full_context else f"Question: {message}"
             )
 
-            if results:
-                web_text = search_text
-                context_parts.append(f"=== WEB SEARCH RESULTS ===\n{search_text}")
+            try:
+                async for token in self._stream_tokens(user_content, parent=root):
+                    yield {"type": "token", "content": token}
+            except Exception as exc:
+                yield {"type": "error", "content": f"Generation error: {exc}"}
+                _end_run(root, {}, error=str(exc))
+                return
 
-                for r in results:
-                    sources.append({
-                        "type": "web_search",
-                        "icon": "🌐",
-                        "label": r["title"] or r["url"],
-                        "detail": r["url"],
-                        "url": r["url"],
-                    })
+            sources.append({
+                "type": "gemini", "icon": "✨",
+                "label": "Gemini 2.5 Flash", "detail": "Google DeepMind",
+            })
+            yield {"type": "sources", "sources": sources}
+            yield {"type": "done"}
 
-                yield {"type": "tool_result", "content": f"Found {len(results)} results"}
-
-                # Save to RAG in background for future recall
-                asyncio.create_task(
-                    asyncio.to_thread(self.rag.add_text, search_text, f"web:{message[:80]}")
-                )
-            else:
-                yield {"type": "status", "content": "Web search returned no results — using Gemini knowledge"}
+            _end_run(root, {
+                "sources_used": len(sources),
+                "web_results": len([s for s in sources if s["type"] == "web_search"]),
+                "rag_chunks": len([s for s in sources if s["type"] == "knowledge_base"]),
+            })
 
         except Exception as exc:
-            yield {"type": "status", "content": f"Web search error: {exc} — using Gemini knowledge"}
+            _end_run(root, {}, error=str(exc))
+            raise
 
-        # ── Step 2: RAG — supplementary context if anything stored ─────
-        try:
-            rag_chunks = await asyncio.to_thread(self.rag.search, message, MAX_RAG_CHUNKS)
-            # Only use RAG chunks that weren't just added from this web search
-            good_chunks = [
-                c for c in rag_chunks
-                if c.metadata.get("score", 0) >= 0.6
-                and not c.metadata.get("source", "").startswith(f"web:{message[:20]}")
-            ]
-            if good_chunks:
-                rag_context = self.rag.build_context(good_chunks)
-                context_parts.append(f"=== KNOWLEDGE BASE (previously stored) ===\n{rag_context}")
-                for chunk in good_chunks[:2]:
-                    sources.append({
-                        "type": "knowledge_base",
-                        "icon": "📚",
-                        "label": chunk.metadata.get("source", "Knowledge Base"),
-                        "detail": f"relevance: {chunk.metadata.get('score', '')}",
-                    })
-        except Exception:
-            pass  # RAG is supplementary — never block the answer
+    # ── Gemini streaming bridge with LangSmith LLM run ───────────────────
 
-        # ── Step 3: Stream Gemini answer ────────────────────────────────
-        yield {"type": "status", "content": "Generating answer…"}
-        await asyncio.sleep(0)
-
-        full_context = "\n\n".join(context_parts)
-        user_content = f"Question: {message}\n\n{full_context}" if full_context else f"Question: {message}"
-
-        try:
-            async for token in self._stream_tokens(user_content):
-                yield {"type": "token", "content": token}
-        except Exception as exc:
-            yield {"type": "error", "content": f"Generation error: {exc}"}
-            return
-
-        sources.append({"type": "gemini", "icon": "✨", "label": "Gemini 2.5 Flash", "detail": "Google DeepMind"})
-        yield {"type": "sources", "sources": sources}
-        yield {"type": "done"}
-
-    # ── Sync → async bridge for Gemini token streaming ─────────────────
-
-    async def _stream_tokens(self, content: str) -> AsyncGenerator[str, None]:
+    async def _stream_tokens(self, content: str,
+                             parent: Optional[RunTree] = None) -> AsyncGenerator[str, None]:
+        """
+        Runs Gemini streaming in a daemon thread, bridges tokens to async via Queue.
+        After all tokens arrive, logs a full LLM run to LangSmith with:
+          - prompt / completion text
+          - prompt_tokens / completion_tokens / total_tokens
+          - latency in seconds
+        """
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
+        meta = {"prompt_tokens": 0, "completion_tokens": 0, "text": []}
+        t0 = time.time()
 
         def _worker():
             try:
@@ -142,14 +226,23 @@ class ResearchAgent:
                         temperature=1.0,
                     ),
                 ):
+                    um = getattr(chunk, "usage_metadata", None)
+                    if um:
+                        meta["prompt_tokens"] = getattr(um, "prompt_token_count", 0) or 0
+                        meta["completion_tokens"] = (
+                            getattr(um, "candidates_token_count", 0) or 0
+                        )
                     try:
                         text = chunk.text
                     except Exception:
                         text = None
                     if text:
+                        meta["text"].append(text)
                         loop.call_soon_threadsafe(queue.put_nowait, text)
             except Exception as exc:
-                loop.call_soon_threadsafe(queue.put_nowait, f"\n\n*[Stream error: {exc}]*")
+                err = f"\n\n*[Stream error: {exc}]*"
+                meta["text"].append(err)
+                loop.call_soon_threadsafe(queue.put_nowait, err)
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
@@ -160,3 +253,29 @@ class ResearchAgent:
             if token is None:
                 break
             yield token
+
+        # ── Log completed LLM run to LangSmith ───────────────────────────
+        latency = round(time.time() - t0, 3)
+        total = meta["prompt_tokens"] + meta["completion_tokens"]
+        llm_run = _start_run(
+            name="Gemini 2.5 Flash",
+            run_type="llm",
+            inputs={
+                "prompts": [content[:3000]],
+                "model": MODEL,
+                "temperature": 1.0,
+            },
+            parent=parent,
+        )
+        _end_run(llm_run, {
+            "generations": [{"text": "".join(meta["text"])}],
+            "llm_output": {
+                "model": MODEL,
+                "token_usage": {
+                    "prompt_tokens": meta["prompt_tokens"],
+                    "completion_tokens": meta["completion_tokens"],
+                    "total_tokens": total,
+                },
+            },
+            "latency_seconds": latency,
+        })
