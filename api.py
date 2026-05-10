@@ -94,6 +94,35 @@ async def chat(req: ChatRequest):
     )
 
 
+@app.get("/pipeline")
+async def pipeline_page():
+    return FileResponse("static/pipeline.html")
+
+
+@app.post("/pipeline/stream")
+async def pipeline_stream(req: ChatRequest):
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if _agent is None:
+        raise HTTPException(status_code=503, detail="Agent still starting up")
+
+    async def event_stream():
+        try:
+            async for event in _agent.pipeline_stream(req.message):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(exc)})}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Connection": "keep-alive"},
+    )
+
+
 # Serve the single-page frontend
 app.mount("/static", StaticFiles(directory="static"), name="static")
 

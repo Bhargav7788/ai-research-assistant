@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Pipeline Monitor — AI Research Assistant</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#07070f;--bg2:#0c0c1a;--bg3:#111128;
+  --surface:rgba(255,255,255,0.04);--surface2:rgba(255,255,255,0.07);
+  --border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.12);
+  --text:#e8eaf6;--text2:#8892b0;--text3:#4a5578;
+  --mono:rgba(100,220,150,0.9);
+  --pending-border:rgba(255,255,255,0.07);
+  --active-c:#3b82f6;--active-glow:rgba(59,130,246,0.35);
+  --complete-c:#10b981;--complete-glow:rgba(16,185,129,0.3);
+  --error-c:#ef4444;--error-glow:rgba(239,68,68,0.3);
+  --accent:#6366f1;--cyan:#06b6d4;
+}
+html,body{height:100%;font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased}
+body{overflow-x:hidden}
+
+/* ── grid bg ── */
+body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-image:linear-gradient(rgba(99,102,241,0.04) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(99,102,241,0.04) 1px,transparent 1px);
+  background-size:48px 48px}
+
+/* ── layout ── */
+#app{position:relative;z-index:1;display:flex;flex-direction:column;min-height:100vh;max-width:820px;margin:0 auto;padding:0 20px 40px}
+
+/* ── header ── */
+header{display:flex;align-items:center;justify-content:space-between;padding:20px 0 18px;border-bottom:1px solid var(--border)}
+.hdr-left{display:flex;align-items:center;gap:12px}
+.hdr-icon{width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#6366f1,#7c3aed);
+  display:flex;align-items:center;justify-content:center;font-size:16px;
+  box-shadow:0 4px 16px rgba(99,102,241,0.4)}
+.hdr-title{font-size:16px;font-weight:700;letter-spacing:-.3px}
+.hdr-sub{font-size:11px;color:var(--text2);margin-top:1px;font-family:'JetBrains Mono',monospace}
+.hdr-right{display:flex;align-items:center;gap:10px}
+.status-pill{display:flex;align-items:center;gap:6px;padding:5px 11px;border-radius:999px;
+  font-size:11px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;
+  border:1px solid var(--border2);background:var(--surface)}
+.status-pill.idle{color:var(--text2)}
+.status-pill.running{color:var(--active-c);border-color:rgba(59,130,246,.3);background:rgba(59,130,246,.08)}
+.status-pill.done{color:var(--complete-c);border-color:rgba(16,185,129,.3);background:rgba(16,185,129,.08)}
+.sdot{width:7px;height:7px;border-radius:50%}
+.idle .sdot{background:var(--text3)}
+.running .sdot{background:var(--active-c);box-shadow:0 0 6px var(--active-c);animation:sdotPulse 1s ease-in-out infinite}
+.done .sdot{background:var(--complete-c)}
+@keyframes sdotPulse{0%,100%{opacity:1}50%{opacity:.4}}
+#total-time{font-size:12px;color:var(--text2);font-family:'JetBrains Mono',monospace}
+
+/* ── metrics bar ── */
+.metrics{display:flex;gap:10px;padding:14px 0;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.metric{flex:1;min-width:110px;padding:10px 14px;border-radius:10px;
+  background:var(--surface);border:1px solid var(--border)}
+.metric-label{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--text3);font-weight:600;margin-bottom:4px}
+.metric-value{font-size:18px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--text);line-height:1}
+.metric-value.highlight{color:var(--active-c)}
+.metric-value.green{color:var(--complete-c)}
+
+/* ── query input ── */
+.query-bar{display:flex;gap:8px;padding:14px 0 8px;align-items:flex-end}
+#q-input{flex:1;background:var(--surface2);border:1px solid var(--border2);border-radius:12px;
+  padding:10px 16px;font-family:'Inter',sans-serif;font-size:14px;color:var(--text);
+  resize:none;max-height:80px;line-height:1.5;outline:none}
+#q-input::placeholder{color:var(--text3)}
+#q-input:focus{border-color:rgba(99,102,241,.4);box-shadow:0 0 0 3px rgba(99,102,241,.1)}
+#run-btn{flex-shrink:0;height:42px;padding:0 20px;border-radius:10px;border:none;cursor:pointer;
+  background:linear-gradient(135deg,#6366f1,#7c3aed);color:#fff;font-weight:600;font-size:14px;
+  transition:.2s ease;box-shadow:0 3px 12px rgba(99,102,241,.4)}
+#run-btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 5px 16px rgba(99,102,241,.55)}
+#run-btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
+
+/* ── pipeline container ── */
+.pipeline{padding:20px 0;display:flex;flex-direction:column;gap:0;position:relative}
+
+/* ── node ── */
+.pnode{border-radius:14px;border:1px solid var(--pending-border);background:var(--surface);
+  padding:14px 16px;transition:.3s ease;position:relative;overflow:hidden}
+.pnode::before{content:'';position:absolute;inset:0;border-radius:14px;opacity:0;transition:.3s ease;pointer-events:none}
+.pnode.active{border-color:var(--active-c);box-shadow:0 0 0 1px rgba(59,130,246,.15),0 4px 24px var(--active-glow)}
+.pnode.active::before{background:linear-gradient(135deg,rgba(59,130,246,.06),transparent);opacity:1;animation:activePulse 1.8s ease-in-out infinite}
+.pnode.complete{border-color:var(--complete-c);box-shadow:0 0 12px var(--complete-glow)}
+.pnode.complete::before{background:linear-gradient(135deg,rgba(16,185,129,.05),transparent);opacity:1}
+.pnode.error{border-color:var(--error-c);box-shadow:0 0 12px var(--error-glow)}
+@keyframes activePulse{0%,100%{opacity:.5}50%{opacity:1}}
+
+.pnode-header{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.pnode-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0;
+  background:var(--surface2);border:1px solid var(--border2)}
+.pnode.active .pnode-icon{background:rgba(59,130,246,.15);border-color:rgba(59,130,246,.3)}
+.pnode.complete .pnode-icon{background:rgba(16,185,129,.12);border-color:rgba(16,185,129,.25)}
+.pnode-info{flex:1;min-width:0}
+.pnode-title{font-size:11px;text-transform:uppercase;letter-spacing:.8px;font-weight:700;color:var(--text2)}
+.pnode.active .pnode-title{color:var(--active-c)}
+.pnode.complete .pnode-title{color:var(--complete-c)}
+.pnode-sub{font-size:12px;color:var(--text3);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pnode-badge{display:flex;align-items:center;gap:5px;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:600;flex-shrink:0}
+.badge-pending{background:rgba(255,255,255,.04);color:var(--text3);border:1px solid var(--border)}
+.badge-active{background:rgba(59,130,246,.12);color:var(--active-c);border:1px solid rgba(59,130,246,.25);animation:badgePulse 1s ease-in-out infinite}
+.badge-complete{background:rgba(16,185,129,.1);color:var(--complete-c);border:1px solid rgba(16,185,129,.2)}
+.badge-error{background:rgba(239,68,68,.1);color:var(--error-c);border:1px solid rgba(239,68,68,.2)}
+@keyframes badgePulse{0%,100%{opacity:1}50%{opacity:.5}}
+
+/* node data grid */
+.pnode-data{display:flex;gap:8px;flex-wrap:wrap}
+.kv{background:var(--bg3);border-radius:6px;padding:5px 9px;font-family:'JetBrains Mono',monospace}
+.kv-key{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--text3);font-weight:600;margin-bottom:2px}
+.kv-val{font-size:12px;color:var(--mono);white-space:nowrap;overflow:hidden;max-width:200px;text-overflow:ellipsis}
+.kv-val.blue{color:var(--active-c)}
+.kv-val.green{color:var(--complete-c)}
+.kv-val.dim{color:var(--text3)}
+
+/* ── connectors ── */
+.connector{display:flex;justify-content:center;height:36px;position:relative}
+.connector-line{width:2px;background:linear-gradient(to bottom,var(--border2),var(--border));position:relative;overflow:hidden;border-radius:1px}
+.connector-line::after{content:'';position:absolute;width:6px;height:6px;border-radius:50%;left:-2px;top:-6px;
+  background:var(--text3);box-shadow:0 0 4px var(--text3);opacity:0}
+.connector.active .connector-line{background:linear-gradient(to bottom,var(--active-c),rgba(59,130,246,.3))}
+.connector.active .connector-line::after{background:var(--active-c);box-shadow:0 0 8px var(--active-c);opacity:1;animation:particleDown 1s linear infinite}
+.connector.complete .connector-line{background:linear-gradient(to bottom,var(--complete-c),rgba(16,185,129,.3))}
+.connector.complete .connector-line::after{background:var(--complete-c);box-shadow:0 0 8px var(--complete-c);opacity:1;animation:none;top:calc(100% - 6px)}
+@keyframes particleDown{0%{top:-6px;opacity:0}15%{opacity:1}85%{opacity:1}100%{top:calc(100% + 6px);opacity:0}}
+
+/* ── parallel section ── */
+.parallel-wrap{display:flex;flex-direction:column;gap:0}
+.parallel-split{display:flex;justify-content:center;height:30px;position:relative}
+.split-svg{width:100%;height:30px;overflow:visible}
+.parallel-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.parallel-merge{display:flex;justify-content:center;height:30px}
+.merge-svg{width:100%;height:30px;overflow:visible}
+
+/* path animations */
+.flow-path{stroke-dasharray:6 4;animation:flowPath 0.7s linear infinite;opacity:0}
+.flow-path.active{opacity:1}
+.flow-path.complete{stroke-dasharray:none;animation:none;opacity:0.7}
+@keyframes flowPath{to{stroke-dashoffset:-10}}
+
+/* ── answer panel ── */
+.answer-panel{margin-top:20px;border-radius:14px;background:var(--surface);border:1px solid var(--border);overflow:hidden;display:none}
+.answer-panel.visible{display:block}
+.answer-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.6px}
+.answer-body{padding:16px;max-height:280px;overflow-y:auto;font-size:14px;line-height:1.7;color:var(--text)}
+.answer-body::-webkit-scrollbar{width:4px}
+.answer-body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+.cursor-blink{display:inline-block;width:2px;height:1em;background:var(--active-c);vertical-align:middle;margin-left:2px;animation:blink .9s step-end infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+.sources-wrap{padding:10px 16px 14px;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;gap:6px}
+.src-chip{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:600;text-decoration:none}
+.src-chip.web_search{background:rgba(59,130,246,.1);color:#93c5fd;border:1px solid rgba(59,130,246,.2)}
+.src-chip.knowledge_base{background:rgba(124,58,237,.1);color:#c4b5fd;border:1px solid rgba(124,58,237,.2)}
+.src-chip.gemini{background:rgba(245,158,11,.1);color:#fcd34d;border:1px solid rgba(245,158,11,.2)}
+
+/* nav link */
+.nav-link{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);text-decoration:none;padding:4px 10px;border-radius:8px;border:1px solid var(--border);transition:.2s}
+.nav-link:hover{color:var(--text);background:var(--surface2)}
+
+@media(max-width:600px){
+  .parallel-row{grid-template-columns:1fr}
+  .metrics{gap:6px}
+  .metric{min-width:calc(50% - 3px)}
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- Header -->
+  <header>
+    <div class="hdr-left">
+      <div class="hdr-icon">⚡</div>
+      <div>
+        <div class="hdr-title">Pipeline Monitor</div>
+        <div class="hdr-sub">AI Research Assistant · Gemini 2.5 Flash + RAG + DuckDuckGo</div>
+      </div>
+    </div>
+    <div class="hdr-right">
+      <a href="/" class="nav-link">← Chat UI</a>
+      <div class="status-pill idle" id="status-pill">
+        <div class="sdot"></div>
+        <span id="status-text">IDLE</span>
+      </div>
+      <div id="total-time">—</div>
+    </div>
+  </header>
+
+  <!-- Metrics -->
+  <div class="metrics">
+    <div class="metric"><div class="metric-label">Total Time</div><div class="metric-value" id="m-time">—</div></div>
+    <div class="metric"><div class="metric-label">Web Results</div><div class="metric-value highlight" id="m-results">—</div></div>
+    <div class="metric"><div class="metric-label">RAG Chunks</div><div class="metric-value" id="m-chunks">—</div></div>
+    <div class="metric"><div class="metric-label">Tokens Generated</div><div class="metric-value green" id="m-tokens">—</div></div>
+  </div>
+
+  <!-- Query input -->
+  <div class="query-bar">
+    <textarea id="q-input" rows="1" placeholder="Ask a question to see the pipeline in action…"></textarea>
+    <button id="run-btn" onclick="runPipeline()">▶ Run</button>
+  </div>
+
+  <!-- Pipeline visualization -->
+  <div class="pipeline" id="pipeline">
+
+    <!-- ① User Query -->
+    <div class="pnode" id="node-query">
+      <div class="pnode-header">
+        <div class="pnode-icon">📥</div>
+        <div class="pnode-info">
+          <div class="pnode-title">User Query</div>
+          <div class="pnode-sub" id="sub-query">Waiting for input…</div>
+        </div>
+        <div class="pnode-badge badge-pending" id="badge-query">● PENDING</div>
+      </div>
+      <div class="pnode-data" id="data-query"></div>
+    </div>
+
+    <div class="connector" id="conn-query"><div class="connector-line"></div></div>
+
+    <!-- ② FastAPI Router -->
+    <div class="pnode" id="node-router">
+      <div class="pnode-header">
+        <div class="pnode-icon">⚡</div>
+        <div class="pnode-info">
+          <div class="pnode-title">FastAPI Router</div>
+          <div class="pnode-sub">POST /pipeline/stream</div>
+        </div>
+        <div class="pnode-badge badge-pending" id="badge-router">● PENDING</div>
+      </div>
+      <div class="pnode-data" id="data-router"></div>
+    </div>
+
+    <!-- Split to parallel -->
+    <div class="parallel-split">
+      <svg class="split-svg" id="split-svg" viewBox="0 0 800 30" preserveAspectRatio="none">
+        <path id="split-left"  d="M 400 0 C 400 15, 200 15, 200 30" stroke="rgba(255,255,255,0.07)" stroke-width="1.5" fill="none"/>
+        <path id="split-right" d="M 400 0 C 400 15, 600 15, 600 30" stroke="rgba(255,255,255,0.07)" stroke-width="1.5" fill="none"/>
+        <path class="flow-path" id="fp-split-left"  d="M 400 0 C 400 15, 200 15, 200 30" stroke="#3b82f6" stroke-width="1.5" fill="none"/>
+        <path class="flow-path" id="fp-split-right" d="M 400 0 C 400 15, 600 15, 600 30" stroke="#3b82f6" stroke-width="1.5" fill="none"/>
+      </svg>
+    </div>
+
+    <!-- ③ Parallel: DuckDuckGo + ChromaDB -->
+    <div class="parallel-row">
+      <!-- Web Search -->
+      <div class="pnode" id="node-web_search">
+        <div class="pnode-header">
+          <div class="pnode-icon">🌐</div>
+          <div class="pnode-info">
+            <div class="pnode-title">DuckDuckGo Search</div>
+            <div class="pnode-sub">MCP Tool — live web search</div>
+          </div>
+          <div class="pnode-badge badge-pending" id="badge-web_search">● PENDING</div>
+        </div>
+        <div class="pnode-data" id="data-web_search"></div>
+      </div>
+      <!-- ChromaDB -->
+      <div class="pnode" id="node-rag">
+        <div class="pnode-header">
+          <div class="pnode-icon">📚</div>
+          <div class="pnode-info">
+            <div class="pnode-title">ChromaDB RAG</div>
+            <div class="pnode-sub">Vector similarity search</div>
+          </div>
+          <div class="pnode-badge badge-pending" id="badge-rag">● PENDING</div>
+        </div>
+        <div class="pnode-data" id="data-rag"></div>
+      </div>
+    </div>
+
+    <!-- Merge from parallel -->
+    <div class="parallel-merge">
+      <svg class="merge-svg" id="merge-svg" viewBox="0 0 800 30" preserveAspectRatio="none">
+        <path id="merge-left"  d="M 200 0 C 200 15, 400 15, 400 30" stroke="rgba(255,255,255,0.07)" stroke-width="1.5" fill="none"/>
+        <path id="merge-right" d="M 600 0 C 600 15, 400 15, 400 30" stroke="rgba(255,255,255,0.07)" stroke-width="1.5" fill="none"/>
+        <path class="flow-path" id="fp-merge-left"  d="M 200 0 C 200 15, 400 15, 400 30" stroke="#3b82f6" stroke-width="1.5" fill="none"/>
+        <path class="flow-path" id="fp-merge-right" d="M 600 0 C 600 15, 400 15, 400 30" stroke="#3b82f6" stroke-width="1.5" fill="none"/>
+      </svg>
+    </div>
+
+    <!-- ④ Context Assembly -->
+    <div class="pnode" id="node-context">
+      <div class="pnode-header">
+        <div class="pnode-icon">⚙️</div>
+        <div class="pnode-info">
+          <div class="pnode-title">Context Assembly</div>
+          <div class="pnode-sub">Web results + RAG chunks combined</div>
+        </div>
+        <div class="pnode-badge badge-pending" id="badge-context">● PENDING</div>
+      </div>
+      <div class="pnode-data" id="data-context"></div>
+    </div>
+
+    <div class="connector" id="conn-context"><div class="connector-line"></div></div>
+
+    <!-- ⑤ Gemini 2.5 Flash -->
+    <div class="pnode" id="node-gemini">
+      <div class="pnode-header">
+        <div class="pnode-icon">✨</div>
+        <div class="pnode-info">
+          <div class="pnode-title">Gemini 2.5 Flash</div>
+          <div class="pnode-sub">LLM generation — streaming enabled</div>
+        </div>
+        <div class="pnode-badge badge-pending" id="badge-gemini">● PENDING</div>
+      </div>
+      <div class="pnode-data" id="data-gemini"></div>
+    </div>
+
+    <div class="connector" id="conn-gemini"><div class="connector-line"></div></div>
+
+    <!-- ⑥ SSE Stream -->
+    <div class="pnode" id="node-sse">
+      <div class="pnode-header">
+        <div class="pnode-icon">📡</div>
+        <div class="pnode-info">
+          <div class="pnode-title">SSE Stream → Browser</div>
+          <div class="pnode-sub">Tokens delivered via Server-Sent Events</div>
+        </div>
+        <div class="pnode-badge badge-pending" id="badge-sse">● PENDING</div>
+      </div>
+      <div class="pnode-data" id="data-sse"></div>
+    </div>
+
+    <div class="connector" id="conn-sse"><div class="connector-line"></div></div>
+
+    <!-- ⑦ Complete -->
+    <div class="pnode" id="node-complete">
+      <div class="pnode-header">
+        <div class="pnode-icon">✅</div>
+        <div class="pnode-info">
+          <div class="pnode-title">Response Complete</div>
+          <div class="pnode-sub">Sources cited — answer delivered</div>
+        </div>
+        <div class="pnode-badge badge-pending" id="badge-complete">● PENDING</div>
+      </div>
+      <div class="pnode-data" id="data-complete"></div>
+    </div>
+
+  </div><!-- /pipeline -->
+
+  <!-- Answer panel -->
+  <div class="answer-panel" id="answer-panel">
+    <div class="answer-header">
+      <span>Generated Answer</span>
+      <span id="answer-token-count" style="color:var(--text3);font-weight:400">0 tokens</span>
+    </div>
+    <div class="answer-body" id="answer-body"></div>
+    <div class="sources-wrap" id="sources-wrap" style="display:none"></div>
+  </div>
+
+</div><!-- /app -->
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+let busy = false;
+let tokenCount = 0;
+let answerText = '';
+let startTime = 0;
+let timerInterval = null;
+
+// ── Textarea auto-resize ──────────────────────────────────────────────────────
+const qInput = document.getElementById('q-input');
+qInput.addEventListener('input', () => {
+  qInput.style.height = 'auto';
+  qInput.style.height = Math.min(qInput.scrollHeight, 80) + 'px';
+});
+qInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runPipeline(); }
+});
+
+// ── Reset all nodes to pending ─────────────────────────────────────────────
+function resetPipeline() {
+  const nodes = ['query','router','web_search','rag','context','gemini','sse','complete'];
+  nodes.forEach(id => {
+    setNode(id, 'pending', {});
+  });
+  // Reset connectors
+  ['conn-query','conn-context','conn-gemini','conn-sse'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.className = 'connector';
+  });
+  // Reset SVG paths
+  ['fp-split-left','fp-split-right','fp-merge-left','fp-merge-right'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.className.baseVal = 'flow-path'; el.setAttribute('stroke','#3b82f6'); }
+  });
+
+  // Reset metrics
+  ['m-time','m-results','m-chunks','m-tokens'].forEach(id => {
+    document.getElementById(id).textContent = '—';
+  });
+
+  // Reset answer panel
+  document.getElementById('answer-panel').className = 'answer-panel';
+  document.getElementById('answer-body').innerHTML = '';
+  document.getElementById('sources-wrap').style.display = 'none';
+  document.getElementById('sources-wrap').innerHTML = '';
+  document.getElementById('answer-token-count').textContent = '0 tokens';
+  tokenCount = 0; answerText = '';
+
+  setStatus('idle');
+  document.getElementById('total-time').textContent = '—';
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+}
+
+// ── Node state updater ────────────────────────────────────────────────────────
+function setNode(stepId, status, data) {
+  const node = document.getElementById('node-' + stepId);
+  const badge = document.getElementById('badge-' + stepId);
+  if (!node) return;
+
+  // Class
+  node.className = 'pnode' + (status !== 'pending' ? ' ' + status : '');
+
+  // Badge
+  if (badge) {
+    const labels = { pending: '● PENDING', active: '⟳ ACTIVE', complete: '✓ DONE', error: '✗ ERROR' };
+    badge.textContent = labels[status] || status.toUpperCase();
+    badge.className = 'pnode-badge badge-' + status;
+  }
+
+  // Data KVs
+  const dataEl = document.getElementById('data-' + stepId);
+  if (dataEl) dataEl.innerHTML = renderKVs(stepId, status, data);
+
+  // Connector before this node
+  activateConnector(stepId, status);
+}
+
+function renderKVs(stepId, status, data) {
+  if (status === 'pending' || !Object.keys(data).length) return '';
+  const kvs = [];
+  const LABELS = {
+    text: 'Query', query: 'Query', endpoint: 'Endpoint',
+    latency_ms: 'Latency', results: 'Results', top_result: 'Top Result',
+    chunks_found: 'Found', chunks_used: 'Used', kb_size: 'KB Size', kb_total: 'KB Total',
+    web_chars: 'Web Chars', rag_chunks: 'RAG Chunks', total_chars: 'Total Chars',
+    model: 'Model', input_chars: 'Input', prompt_tokens: 'Prompt Tokens',
+    completion_tokens: 'Output Tokens', total_tokens: 'Total Tokens',
+    status: 'Status', tokens: 'Tokens', tokens_per_sec: 'Tokens/sec',
+    tokens_streamed: 'Streamed', total_ms: 'Total Time',
+    web_results: 'Web Results', error: 'Error',
+  };
+  for (const [k, v] of Object.entries(data)) {
+    if (v === undefined || v === null) continue;
+    const label = LABELS[k] || k;
+    let val = v;
+    let cls = '';
+    if (typeof v === 'number') {
+      if (k.endsWith('_ms') || k === 'total_ms') { val = v + ' ms'; cls = v > 2000 ? '' : 'green'; }
+      else if (k === 'tokens_per_sec') { val = v + ' t/s'; cls = 'blue'; }
+      else if (k.includes('token')) { val = v.toLocaleString(); cls = 'green'; }
+      else { val = v.toLocaleString(); }
+    } else if (typeof v === 'string' && v.length > 55) {
+      val = v.slice(0, 55) + '…';
+    }
+    kvs.push(`<div class="kv"><div class="kv-key">${label}</div><div class="kv-val ${cls}">${val}</div></div>`);
+  }
+  return kvs.join('');
+}
+
+// ── Connector animations ──────────────────────────────────────────────────────
+const CONNECTOR_MAP = {
+  router:     'conn-query',
+  web_search: null,   // handled by SVG split
+  rag:        null,
+  context:    null,   // handled by SVG merge
+  gemini:     'conn-context',
+  sse:        'conn-gemini',
+  complete:   'conn-sse',
+};
+
+function activateConnector(stepId, status) {
+  const connId = CONNECTOR_MAP[stepId];
+  if (connId) {
+    const el = document.getElementById(connId);
+    if (el) el.className = 'connector ' + (status === 'pending' ? '' : status);
+  }
+
+  // SVG parallel paths
+  if (stepId === 'web_search' || stepId === 'rag') {
+    const suffix = stepId === 'web_search' ? 'left' : 'right';
+    activateSvgPath('fp-split-' + suffix, status);
+    activateSvgPath('fp-merge-' + suffix, status);
+  }
+  if (stepId === 'context') {
+    // Both merge paths complete when context starts
+    ['fp-merge-left','fp-merge-right'].forEach(id => activateSvgPath(id, status));
+  }
+}
+
+function activateSvgPath(id, status) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const base = 'flow-path';
+  if (status === 'active') el.setAttribute('class', base + ' active');
+  else if (status === 'complete') { el.setAttribute('class', base + ' complete'); el.setAttribute('stroke','#10b981'); }
+  else el.setAttribute('class', base);
+}
+
+// ── Status pill ───────────────────────────────────────────────────────────────
+function setStatus(state) {
+  const pill = document.getElementById('status-pill');
+  const text = document.getElementById('status-text');
+  pill.className = 'status-pill ' + state;
+  text.textContent = state.toUpperCase();
+}
+
+// ── Main run function ─────────────────────────────────────────────────────────
+async function runPipeline() {
+  const q = qInput.value.trim();
+  if (!q || busy) return;
+
+  busy = true;
+  document.getElementById('run-btn').disabled = true;
+  resetPipeline();
+  setStatus('running');
+
+  // Show answer panel immediately
+  document.getElementById('answer-panel').className = 'answer-panel visible';
+
+  startTime = Date.now();
+  timerInterval = setInterval(() => {
+    document.getElementById('total-time').textContent = ((Date.now() - startTime) / 1000).toFixed(1) + 's';
+  }, 100);
+
+  try {
+    const resp = await fetch('/pipeline/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: q }),
+    });
+    if (!resp.ok) throw new Error('Server error ' + resp.status);
+
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let rafPending = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+
+      while (buf.includes('\n')) {
+        const nl = buf.indexOf('\n');
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (raw === '[DONE]') break;
+        try { handleEvent(JSON.parse(raw)); } catch {}
+      }
+    }
+  } catch (err) {
+    setStatus('idle');
+    document.getElementById('answer-body').innerHTML = `<span style="color:#f87171">⚠ ${err.message}</span>`;
+  } finally {
+    busy = false;
+    document.getElementById('run-btn').disabled = false;
+    clearInterval(timerInterval);
+    timerInterval = null;
+    setStatus('done');
+  }
+}
+
+// ── Event handler ─────────────────────────────────────────────────────────────
+function handleEvent(ev) {
+  if (ev.type === 'pipeline_step') {
+    const { step, status, data, elapsed_ms } = ev;
+    setNode(step, status, data);
+
+    if (step === 'complete' && status === 'complete') {
+      document.getElementById('m-time').textContent = (data.total_ms || 0) + ' ms';
+      document.getElementById('m-results').textContent = data.web_results ?? '—';
+      document.getElementById('m-chunks').textContent = data.rag_chunks ?? '—';
+      document.getElementById('m-tokens').textContent = (data.tokens || tokenCount).toLocaleString();
+      document.getElementById('total-time').textContent = ((data.total_ms || 0) / 1000).toFixed(2) + 's';
+    }
+  } else if (ev.type === 'token') {
+    tokenCount++;
+    answerText += ev.content;
+    document.getElementById('answer-token-count').textContent = tokenCount + ' tokens';
+    renderAnswer(false);
+  } else if (ev.type === 'sources') {
+    renderAnswer(true);
+    showSources(ev.sources);
+  } else if (ev.type === 'done') {
+    renderAnswer(true);
+    document.getElementById('m-tokens').textContent = tokenCount.toLocaleString();
+  } else if (ev.type === 'error') {
+    document.getElementById('answer-body').innerHTML = `<span style="color:#f87171">⚠ ${ev.content}</span>`;
+  }
+}
+
+// ── Answer rendering ──────────────────────────────────────────────────────────
+let rafId = null;
+function renderAnswer(final) {
+  if (rafId) return;
+  rafId = requestAnimationFrame(() => {
+    rafId = null;
+    const body = document.getElementById('answer-body');
+    // Simple text rendering (no markdown dependency)
+    const escaped = answerText
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+      .replace(/`([^`]+)`/g,'<code style="font-family:monospace;background:rgba(255,255,255,.07);padding:1px 5px;border-radius:4px;font-size:13px">$1</code>')
+      .replace(/\n/g,'<br>');
+    body.innerHTML = escaped + (final ? '' : '<span class="cursor-blink"></span>');
+    body.scrollTop = body.scrollHeight;
+  });
+}
+
+function showSources(sources) {
+  const wrap = document.getElementById('sources-wrap');
+  if (!sources || !sources.length) return;
+  wrap.style.display = 'flex';
+  wrap.innerHTML = sources.map(s => {
+    const tag = s.url ? 'a' : 'span';
+    const href = s.url ? `href="${s.url}" target="_blank" rel="noopener"` : '';
+    return `<${tag} class="src-chip ${s.type}" ${href}>${s.icon} ${esc(s.label.slice(0,40))}</${tag}>`;
+  }).join('');
+}
+
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Pre-fill a demo question if URL has ?q=
+const urlQ = new URLSearchParams(location.search).get('q');
+if (urlQ) { qInput.value = urlQ; }
+</script>
+</body>
+</html>

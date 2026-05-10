@@ -200,6 +200,184 @@ class ResearchAgent:
             _end_run(root, {}, error=str(exc))
             raise
 
+    # ── Pipeline visualization stream ─────────────────────────────────────
+
+    async def pipeline_stream(self, message: str) -> AsyncGenerator[Dict, None]:
+        """
+        Like stream() but emits granular pipeline_step events so the /pipeline
+        visualization page can animate each stage with live timing & data.
+        """
+        t0 = time.time()
+
+        def ms() -> int:
+            return round((time.time() - t0) * 1000)
+
+        def step(step_id: str, status: str, data: dict = None):
+            return {
+                "type": "pipeline_step",
+                "step": step_id,
+                "status": status,
+                "data": data or {},
+                "elapsed_ms": ms(),
+            }
+
+        # ① Query received
+        yield step("query", "complete", {"text": message[:120]})
+        await asyncio.sleep(0)
+
+        # ② FastAPI router
+        yield step("router", "complete", {"endpoint": "POST /pipeline/stream", "latency_ms": ms()})
+        await asyncio.sleep(0)
+
+        # ③ Web search
+        yield step("web_search", "active", {"query": message[:80]})
+        await asyncio.sleep(0)
+
+        ws_t = time.time()
+        search_text, results = "", []
+        try:
+            search_text, results = await asyncio.to_thread(
+                web_search_structured, message, MAX_WEB_RESULTS
+            )
+            ws_ms = round((time.time() - ws_t) * 1000)
+            yield step("web_search", "complete", {
+                "results": len(results),
+                "latency_ms": ws_ms,
+                "top_result": results[0]["title"][:55] if results else "No results",
+            })
+            if search_text:
+                asyncio.create_task(
+                    asyncio.to_thread(self.rag.add_text, search_text, f"web:{message[:80]}")
+                )
+        except Exception as exc:
+            yield step("web_search", "error", {"error": str(exc)[:80]})
+
+        # ④ RAG retrieval (runs after web search for simplicity)
+        yield step("rag", "active", {"query": message[:80], "kb_size": self.rag.total_chunks()})
+        await asyncio.sleep(0)
+
+        rag_t = time.time()
+        rag_chunks, good_chunks = [], []
+        try:
+            rag_chunks = await asyncio.to_thread(self.rag.search, message, MAX_RAG_CHUNKS)
+            rag_ms = round((time.time() - rag_t) * 1000)
+            good_chunks = [
+                c for c in rag_chunks
+                if c.metadata.get("score", 0) >= 0.6
+                and not c.metadata.get("source", "").startswith(f"web:{message[:20]}")
+            ]
+            yield step("rag", "complete", {
+                "chunks_found": len(rag_chunks),
+                "chunks_used": len(good_chunks),
+                "latency_ms": rag_ms,
+                "kb_total": self.rag.total_chunks(),
+            })
+        except Exception as exc:
+            yield step("rag", "error", {"error": str(exc)[:80]})
+
+        # ⑤ Context assembly
+        yield step("context", "active", {})
+        await asyncio.sleep(0)
+
+        context_parts = []
+        if results:
+            context_parts.append(f"=== WEB SEARCH RESULTS ===\n{search_text}")
+        if good_chunks:
+            context_parts.append(f"=== KNOWLEDGE BASE ===\n{self.rag.build_context(good_chunks)}")
+
+        full_context = "\n\n".join(context_parts)
+        user_content = (
+            f"Question: {message}\n\n{full_context}" if full_context else f"Question: {message}"
+        )
+        yield step("context", "complete", {
+            "web_chars": len(search_text),
+            "rag_chunks": len(good_chunks),
+            "total_chars": len(user_content),
+        })
+        await asyncio.sleep(0)
+
+        # ⑥ Gemini generation
+        yield step("gemini", "active", {"model": MODEL, "input_chars": len(user_content)})
+        await asyncio.sleep(0)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        meta = {"prompt_tokens": 0, "completion_tokens": 0, "text": []}
+        gen_t = time.time()
+        token_count = 0
+
+        def _pworker():
+            try:
+                for chunk in self._client.models.generate_content_stream(
+                    model=MODEL,
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT, temperature=1.0
+                    ),
+                ):
+                    um = getattr(chunk, "usage_metadata", None)
+                    if um:
+                        meta["prompt_tokens"] = getattr(um, "prompt_token_count", 0) or 0
+                        meta["completion_tokens"] = getattr(um, "candidates_token_count", 0) or 0
+                    try:
+                        text = chunk.text
+                    except Exception:
+                        text = None
+                    if text:
+                        meta["text"].append(text)
+                        loop.call_soon_threadsafe(queue.put_nowait, text)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, f"*[Error: {exc}]*")
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        threading.Thread(target=_pworker, daemon=True).start()
+
+        # ⑦ SSE streaming tokens
+        yield step("sse", "active", {"status": "streaming"})
+        await asyncio.sleep(0)
+
+        while True:
+            token = await queue.get()
+            if token is None:
+                break
+            token_count += 1
+            yield {"type": "token", "content": token}
+            if token_count % 20 == 0:
+                tps = round(token_count / max(0.001, time.time() - gen_t))
+                yield step("sse", "active", {"tokens": token_count, "tokens_per_sec": tps})
+
+        gen_ms = round((time.time() - gen_t) * 1000)
+        total_ms = ms()
+
+        yield step("gemini", "complete", {
+            "prompt_tokens": meta["prompt_tokens"],
+            "completion_tokens": meta["completion_tokens"],
+            "total_tokens": meta["prompt_tokens"] + meta["completion_tokens"],
+            "latency_ms": gen_ms,
+        })
+        yield step("sse", "complete", {"tokens_streamed": token_count, "latency_ms": gen_ms})
+
+        sources = [
+            {"type": "web_search", "icon": "🌐", "label": r["title"] or r["url"],
+             "detail": r["url"], "url": r["url"]} for r in results
+        ]
+        if good_chunks:
+            for c in good_chunks[:2]:
+                sources.append({"type": "knowledge_base", "icon": "📚",
+                                "label": c.metadata.get("source", "KB"), "detail": ""})
+        sources.append({"type": "gemini", "icon": "✨", "label": "Gemini 2.5 Flash",
+                        "detail": "Google DeepMind"})
+
+        yield {"type": "sources", "sources": sources}
+        yield step("complete", "complete", {
+            "total_ms": total_ms,
+            "web_results": len(results),
+            "rag_chunks": len(good_chunks),
+            "tokens": token_count,
+        })
+        yield {"type": "done"}
+
     # ── Gemini streaming bridge with LangSmith LLM run ───────────────────
 
     async def _stream_tokens(self, content: str,
